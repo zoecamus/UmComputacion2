@@ -5,14 +5,14 @@ import json
 import sys
 
 import agregador
-from analizadores import resumen, memoria, sistema
+from analizadores import resumen, memoria, sistema, threads, senales
 
 # --- Configuración de intervalos (segundos) ---
 # Se usan multiprocessing.Value en vez de floats comunes porque estos
 # valores los va a leer un PROCESO DISTINTO (el analizador). Un float
 # normal de Python no cruza la frontera de fork(); Value sí, porque vive
 # en un segmento de memoria compartida real (mmap anónimo por debajo).
-INTERVALOS_DEFAULT = {"resumen": 2.0, "memoria": 3.0, "sistema": 2.0}
+INTERVALOS_DEFAULT = {"resumen": 2.0, "memoria": 3.0, "sistema": 2.0, "threads": 2.0, "senales": 10.0}
 
 evento_stop = multiprocessing.Event()
 
@@ -65,6 +65,16 @@ def main():
             args=(snapshot, intervalos["sistema"], evento_stop),
             name="analizador-sistema",
         ),
+        multiprocessing.Process(
+            target=threads.correr,
+            args=(snapshot, intervalos["threads"], evento_stop),
+            name="analizador-threads",
+        ),
+        multiprocessing.Process(
+            target=senales.correr,
+            args=(snapshot, intervalos["senales"], evento_stop),
+            name="analizador-senales",
+        ),
     ]
 
     for p in procesos:
@@ -97,6 +107,14 @@ def _pintar(snapshot):
     print(f"{'PID':>7} {'PPID':>7} {'ESTADO':>7} {'THREADS':>8}  COMANDO")
     for pid, info in list(res.items())[:20]:
         print(f"{pid:>7} {info['ppid']:>7} {info['estado']:>7} {info['threads']:>8}  {info['comm']}")
+
+    thr = snapshot["threads"]["datos"]
+    total_threads = sum(len(t) for t in thr.values())
+    print(f"\n[threads] {total_threads} threads (LWPs) detectados en {len(thr)} procesos")
+
+    sen = snapshot["senales"]["datos"]
+    con_handler = sum(1 for s in sen.values() if s.get("con_handler"))
+    print(f"[señales] {con_handler} de {len(sen)} procesos tienen al menos 1 señal con handler propio")
 
 
 if __name__ == "__main__":

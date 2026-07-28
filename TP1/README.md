@@ -4,7 +4,9 @@
 
 Monitor de procesos de Linux que lee `/proc` directamente (sin `psutil`) y
 muestra en terminal: lista de procesos con PID/PPID/estado/threads,
-memoria por proceso, y estadísticas globales de CPU/memoria/load average.
+memoria por proceso, threads (LWPs) con context switches, señales
+decodificadas (bloqueadas/ignoradas/con handler/pendientes), y
+estadísticas globales de CPU/memoria/load average.
 Arquitectura multiproceso: un proceso por cada dimensión de datos, todos
 escribiendo a un snapshot compartido que el proceso principal imprime.
 
@@ -16,24 +18,24 @@ docker compose up --build
 
 Dentro, Ctrl+C corta limpio. Desde otra terminal:
 ```bash
-docker exec -it <container> sh -c 'kill -USR1 1'   # dump del snapshot a JSON
+docker exec -it <nombre_del_container> sh -c 'kill -USR1 1'   # dump del snapshot a JSON
 ```
 
 ## Arquitectura
 
 ```
-        Manager().dict()  [snapshot compartido]
-         resumen | memoria | sistema
-              ▲       ▲        ▲
-              │       │        │
-        ┌─────┴──┐┌───┴────┐┌──┴─────┐
-        │resumen ││memoria ││sistema │   <- 3 Process independientes,
-        │cada 2s ││cada 3s ││cada 2s │      cada uno con su propio intervalo
-        └────────┘└────────┘└────────┘      (multiprocessing.Value)
-                       │
-                       ▼
-                 main.py imprime
-                 el snapshot cada 1s
+              Manager().dict()  [snapshot compartido]
+       resumen | memoria | sistema | threads | senales
+          ▲        ▲         ▲         ▲          ▲
+          │        │         │         │          │
+    ┌─────┴──┐┌────┴───┐┌────┴───┐┌────┴───┐┌─────┴────┐
+    │resumen ││memoria ││sistema ││threads ││ senales  │  <- 5 Process
+    │cada 2s ││cada 3s ││cada 2s ││cada 2s ││cada 10s  │     independientes,
+    └────────┘└────────┘└────────┘└────────┘└──────────┘     cada uno con
+                             │                                su intervalo
+                             ▼                            (multiprocessing.Value)
+                       main.py imprime
+                       el snapshot cada 1s
 ```
 
 ## Decisiones de diseño
@@ -57,6 +59,19 @@ docker exec -it <container> sh -c 'kill -USR1 1'   # dump del snapshot a JSON
 - **CPU% global por delta de jiffies**: una sola lectura de `/proc/stat`
   da un acumulado desde el boot, no un porcentaje instantáneo. Se necesita
   comparar dos lecturas separadas por el intervalo de refresco.
+- **Threads vía `/proc/<pid>/task/<tid>/`**: cada TID tiene su propio
+  `stat` con el mismo formato que el `stat` de un proceso — por eso
+  `leer_stat_thread` reutiliza la misma lógica de parseo de `comm` entre
+  paréntesis que ya usábamos para procesos.
+- **Decodificación de máscaras de señales (`SigBlk`, etc.)**: son enteros
+  de 64 bits en hexadecimal donde el bit `N-1` representa la señal número
+  `N` (bit 0 = señal 1 = `SIGHUP`). Se recorre cada bit con
+  `valor & (1 << (n-1))` y se traduce el número a nombre con el módulo
+  `signal` de la stdlib (`signal.Signals(n).name`).
+- **Intervalo de señales más largo (10s) que el de resumen (2s)**: leer y
+  decodificar 5 máscaras de 64 bits por proceso es más costoso que leer
+  un par de campos de `stat`; además esos datos cambian con mucha menos
+  frecuencia que el estado o el CPU% de un proceso.
 
 ## Conceptos del curso aplicados
 
@@ -70,13 +85,26 @@ docker exec -it <container> sh -c 'kill -USR1 1'   # dump del snapshot a JSON
 - **Señales async-signal-safe**: los handlers de `SIGINT`/`SIGTERM` solo
   setean un `Event`, sin hacer I/O adentro del handler; el trabajo pesado
   (join de procesos) ocurre en el loop principal (Clase 6).
+- **Threads como LWPs (light-weight processes)**: cada thread de un
+  proceso tiene su propia entrada en `/proc/<pid>/task/<tid>/`, con su
+  propio estado y sus propios context switches — el kernel los trata como
+  entidades schedulables casi idénticas a un proceso, solo que comparten
+  memoria (Clase 10).
+- **Máscaras de señales (`SigBlk`/`SigIgn`/`SigCgt`/`SigPnd`/`ShdPnd`)**:
+  bloqueada ≠ ignorada ≠ manejada — una señal bloqueada queda pendiente
+  hasta desbloquearse, una ignorada se descarta sin efecto, y una con
+  handler dispara la función instalada por el proceso (Clase 6).
+- **Context switches voluntarios vs involuntarios**: un voluntario ocurre
+  cuando el proceso cede la CPU (ej: espera I/O); un involuntario ocurre
+  cuando el scheduler se la quita porque se le acabó el quantum — por eso
+  procesos CPU-bound tienden a acumular más involuntarios (Clase 10).
 
 ## Limitaciones conocidas
 
 Esta es una versión **recortada por tiempo**, no la especificación completa:
 
-- Solo 3 de los 7 analizadores obligatorios (resumen, memoria, sistema).
-  Faltan: FDs, threads (LWPs), señales, scheduling.
+- 5 de los 7 analizadores obligatorios (resumen, memoria, sistema,
+  threads, señales). Faltan: FDs y scheduling.
 - No hay TUI real con vistas alternables ni navegación por teclado — solo
   impresión secuencial en terminal.
 - Faltan `SIGHUP` (reload de config) y `SIGWINCH`.

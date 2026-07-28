@@ -97,3 +97,91 @@ def leer_cpu_global():
     etiquetas = ["user", "nice", "system", "idle", "iowait", "irq", "softirq"]
     valores = [int(x) for x in primera[1:]]
     return dict(zip(etiquetas, valores))
+
+
+# ---------- THREADS (LWPs) ----------
+
+def listar_tids(pid):
+    """TIDs (thread IDs) de un proceso: carpetas numéricas de /proc/<pid>/task."""
+    try:
+        return [int(n) for n in os.listdir(f"{PROC}/{pid}/task") if n.isdigit()]
+    except FileNotFoundError:
+        return []
+
+
+def leer_stat_thread(pid, tid):
+    """Igual que leer_stat pero para un thread individual (mismo formato de archivo)."""
+    try:
+        with open(f"{PROC}/{pid}/task/{tid}/stat") as f:
+            linea = f.read()
+    except FileNotFoundError:
+        return None
+    inicio = linea.find('(')
+    fin = linea.rfind(')')
+    comm = linea[inicio + 1:fin]
+    resto = linea[fin + 2:].split()
+    return {"tid": tid, "comm": comm, "estado": resto[0]}
+
+
+def leer_ctxt_switches(pid, tid):
+    """voluntary_ctxt_switches / nonvoluntary_ctxt_switches desde status del thread."""
+    try:
+        with open(f"{PROC}/{pid}/task/{tid}/status") as f:
+            contenido = f.read()
+    except FileNotFoundError:
+        return None
+    vol = nonvol = 0
+    for linea in contenido.splitlines():
+        if linea.startswith("voluntary_ctxt_switches:"):
+            vol = int(linea.split(":")[1].strip())
+        elif linea.startswith("nonvoluntary_ctxt_switches:"):
+            nonvol = int(linea.split(":")[1].strip())
+    return {"voluntarios": vol, "involuntarios": nonvol}
+
+
+# ---------- SEÑALES ----------
+
+import signal as _signal_mod
+
+_NOMBRES_SENAL = {}
+for _i in range(1, 65):
+    try:
+        _NOMBRES_SENAL[_i] = _signal_mod.Signals(_i).name
+    except ValueError:
+        _NOMBRES_SENAL[_i] = f"SIG{_i}"  # número real-time sin nombre estándar
+
+
+def decodificar_mascara(hexstr):
+    """
+    Convierte una máscara hex de 64 bits (ej: SigBlk) en la lista de nombres
+    de señal cuyo bit está en 1. El bit N-1 corresponde a la señal N
+    (bit 0 = SIGHUP=1, bit 1 = SIGINT=2, etc. — la señal 0 no existe).
+    """
+    valor = int(hexstr, 16)
+    activas = []
+    for numero_senal in range(1, 65):
+        if valor & (1 << (numero_senal - 1)):
+            activas.append(_NOMBRES_SENAL.get(numero_senal, f"SIG{numero_senal}"))
+    return activas
+
+
+def leer_senales(pid):
+    """Lee SigBlk/SigIgn/SigCgt/SigPnd/ShdPnd de /proc/<pid>/status y los decodifica."""
+    campos = {}
+    try:
+        with open(f"{PROC}/{pid}/status") as f:
+            for linea in f:
+                if ":" not in linea:
+                    continue
+                clave, valor = linea.split(":", 1)
+                campos[clave.strip()] = valor.strip()
+    except FileNotFoundError:
+        return None
+
+    claves = {"SigBlk": "bloqueadas", "SigIgn": "ignoradas", "SigCgt": "con_handler",
+              "SigPnd": "pendientes", "ShdPnd": "pendientes_grupo"}
+    resultado = {}
+    for clave_proc, nombre in claves.items():
+        hexstr = campos.get(clave_proc, "0")
+        resultado[nombre] = decodificar_mascara(hexstr)
+    return resultado
