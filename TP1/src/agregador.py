@@ -24,4 +24,7 @@ def snapshot_inicial():
         "resumen": {"datos": {}, "ts": 0},
         "memoria": {"datos": {}, "ts": 0},
         "sistema": {"datos": {}, "ts": 0},
+        "threads": {"datos": {}, "ts": 0},
+        "senales": {"datos": {}, "ts": 0},
+        "fds": {"datos": {}, "ts": 0},
     }

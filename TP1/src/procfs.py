@@ -185,3 +185,42 @@ def leer_senales(pid):
         hexstr = campos.get(clave_proc, "0")
         resultado[nombre] = decodificar_mascara(hexstr)
     return resultado
+
+
+# ---------- FILE DESCRIPTORS ----------
+
+def leer_fds(pid):
+    """
+    Lista /proc/<pid>/fd/: cada entrada es un symlink a lo que apunta ese FD
+    (un archivo real, un socket, una pipe, etc). Requiere permisos -- si el
+    proceso no es tuyo (ni corrés como root), esto puede dar PermissionError,
+    que se trata igual que "no pude leerlo" y no como un crash.
+
+    Devuelve (cantidad_total, conteo_por_tipo), donde tipo es uno de:
+    'archivo', 'socket', 'pipe', 'anon_inode', 'otro'.
+    """
+    ruta = f"{PROC}/{pid}/fd"
+    try:
+        entradas = os.listdir(ruta)
+    except (FileNotFoundError, PermissionError):
+        return None
+
+    conteo = {"archivo": 0, "socket": 0, "pipe": 0, "anon_inode": 0, "otro": 0}
+    for fd in entradas:
+        try:
+            destino = os.readlink(f"{ruta}/{fd}")
+        except (FileNotFoundError, PermissionError):
+            continue  # el FD se cerró entre el listado y la lectura (TOCTOU otra vez)
+
+        if destino.startswith("socket:"):
+            conteo["socket"] += 1
+        elif destino.startswith("pipe:"):
+            conteo["pipe"] += 1
+        elif destino.startswith("anon_inode:"):
+            conteo["anon_inode"] += 1
+        elif destino.startswith("/"):
+            conteo["archivo"] += 1
+        else:
+            conteo["otro"] += 1
+
+    return {"total": len(entradas), "por_tipo": conteo}
