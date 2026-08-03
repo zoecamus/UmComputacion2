@@ -29,15 +29,43 @@ def correr(snapshot, intervalo, evento_stop):
 
         meminfo = procfs.leer_meminfo()
         load1, load5, load15 = procfs.leer_loadavg()
+        uptime_seg, btime = procfs.leer_uptime_boot()
+
+        # Conteo de procesos por estado y threads totales: recorremos
+        # /proc de nuevo acá (independiente del analizador resumen, que
+        # corre en su propio proceso con su propio intervalo).
+        por_estado = {}
+        threads_totales = 0
+        zombies = 0
+        total_procesos = 0
+        for pid in procfs.listar_pids():
+            info = procfs.leer_stat(pid)
+            if info is None:
+                continue
+            total_procesos += 1
+            por_estado[info["estado"]] = por_estado.get(info["estado"], 0) + 1
+            threads_totales += info["num_threads"]
+            if info["estado"] == "Z":
+                zombies += 1
 
         datos = {
             "cpu_pct": round(cpu_pct, 1),
             "mem_total_kb": meminfo.get("MemTotal", 0),
             "mem_libre_kb": meminfo.get("MemFree", 0),
             "mem_disponible_kb": meminfo.get("MemAvailable", 0),
+            "mem_buffers_kb": meminfo.get("Buffers", 0),
+            "mem_cached_kb": meminfo.get("Cached", 0),
+            "mem_swap_total_kb": meminfo.get("SwapTotal", 0),
+            "mem_swap_libre_kb": meminfo.get("SwapFree", 0),
             "load1": load1,
             "load5": load5,
             "load15": load15,
+            "uptime_seg": uptime_seg,
+            "boot_epoch": btime,
+            "total_procesos": total_procesos,
+            "por_estado": por_estado,
+            "threads_totales": threads_totales,
+            "zombies": zombies,
         }
 
         snapshot["sistema"] = {"datos": datos, "ts": time.time()}

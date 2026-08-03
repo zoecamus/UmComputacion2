@@ -8,8 +8,22 @@ def listar_pids():
     return [int(n) for n in os.listdir(PROC) if n.isdigit()]
 
 
+_POLICIAS = {0: "SCHED_OTHER", 1: "SCHED_FIFO", 2: "SCHED_RR",
+             3: "SCHED_BATCH", 5: "SCHED_IDLE", 6: "SCHED_DEADLINE"}
+
+CLK_TCK = os.sysconf("SC_CLK_TCK")  # jiffies por segundo, típicamente 100
+
+
 def leer_stat(pid):
-    """Parsea /proc/<pid>/stat. None si el proceso ya no existe (TOCTOU)."""
+    """
+    Parsea /proc/<pid>/stat. None si el proceso ya no existe (TOCTOU).
+
+    Formato real (man proc(5)): "<pid> (<comm>) <resto de campos>".
+    `comm` va entre el PRIMER '(' y el ÚLTIMO ')' porque puede contener
+    espacios o paréntesis. Todo lo posterior son campos separados por un
+    solo espacio, numerados desde el campo 3 (el propio 'comm' es el 2).
+    Por eso resto[0] es el campo 3, resto[i] es el campo (i+3).
+    """
     try:
         with open(f"{PROC}/{pid}/stat") as f:
             linea = f.read()
@@ -21,16 +35,25 @@ def leer_stat(pid):
     comm = linea[inicio + 1:fin]
     resto = linea[fin + 2:].split()
 
-    # Campos posteriores a comm, 0-indexados desde el campo 3 del stat real:
-    # resto[0]=state resto[1]=ppid ... resto[10]=minflt resto[12]=majflt
-    # resto[11]=cminflt resto[13]=cmajflt resto[10..16] ver man proc(5)
+    policy_num = int(resto[38]) if len(resto) > 38 else 0
+
     return {
         "pid": pid,
         "comm": comm,
-        "estado": resto[0],
-        "ppid": int(resto[1]),
-        "utime": int(resto[11]),   # campo 14 real
-        "stime": int(resto[12]),   # campo 15 real
+        "estado": resto[0],                    # campo 3
+        "ppid": int(resto[1]),                  # campo 4
+        "pgrp": int(resto[2]),                  # campo 5 (PGID)
+        "sid": int(resto[3]),                   # campo 6 (SID)
+        "minflt": int(resto[7]),                # campo 10
+        "majflt": int(resto[9]),                # campo 12
+        "utime": int(resto[11]),                # campo 14
+        "stime": int(resto[12]),                # campo 15
+        "priority": int(resto[15]),              # campo 18
+        "nice": int(resto[16]),                  # campo 19
+        "num_threads": int(resto[17]),           # campo 20
+        "rt_priority": int(resto[37]) if len(resto) > 37 else 0,  # campo 40
+        "policy_num": policy_num,                                  # campo 41
+        "policy": _POLICIAS.get(policy_num, f"SCHED_{policy_num}"),
     }
 
 
@@ -64,12 +87,39 @@ def leer_status(pid):
         v = v.split()[0] if v else ""
         return int(v) if v.isdigit() else default
 
+    uid_real = campos.get("Uid", "0").split()[0]
+
     return {
         "threads": num("Threads"),
         "vm_size_kb": num("VmSize"),
         "vm_rss_kb": num("VmRSS"),
+        "vm_hwm_kb": num("VmHWM"),
+        "vm_data_kb": num("VmData"),
+        "vm_stk_kb": num("VmStk"),
+        "vm_exe_kb": num("VmExe"),
+        "vm_lib_kb": num("VmLib"),
         "vm_swap_kb": num("VmSwap"),
+        "uid": int(uid_real) if uid_real.isdigit() else 0,
+        "ctxt_voluntarios": num("voluntary_ctxt_switches"),
+        "ctxt_involuntarios": num("nonvoluntary_ctxt_switches"),
+        "cpus_allowed": campos.get("Cpus_allowed_list", ""),
     }
+
+
+_CACHE_USUARIOS = {}
+
+
+def resolver_usuario(uid):
+    """uid numérico -> nombre de usuario, usando /etc/passwd. Cachea resultados."""
+    if uid in _CACHE_USUARIOS:
+        return _CACHE_USUARIOS[uid]
+    try:
+        import pwd
+        nombre = pwd.getpwuid(uid).pw_name
+    except (KeyError, ImportError):
+        nombre = str(uid)
+    _CACHE_USUARIOS[uid] = nombre
+    return nombre
 
 
 def leer_meminfo():
@@ -99,6 +149,56 @@ def leer_cpu_global():
     return dict(zip(etiquetas, valores))
 
 
+def leer_uptime_boot():
+    """/proc/uptime (segundos desde el boot) y btime de /proc/stat (epoch del boot)."""
+    with open(f"{PROC}/uptime") as f:
+        uptime_seg = float(f.read().split()[0])
+    btime = 0
+    with open(f"{PROC}/stat") as f:
+        for linea in f:
+            if linea.startswith("btime"):
+                btime = int(linea.split()[1])
+                break
+    return uptime_seg, btime
+
+
+def leer_maps_resumen(pid):
+    """
+    Agrupa /proc/<pid>/maps (líneas 'start-end perms offset dev inode path')
+    en categorías por tamaño total en KB: heap, stack, texto (código, perms
+    con 'x'), datos (perms 'rw-' sin ser heap/stack), y resto (bibliotecas
+    compartidas, mappings anónimos, etc). None si no existe o sin permiso.
+    """
+    try:
+        with open(f"{PROC}/{pid}/maps") as f:
+            lineas = f.readlines()
+    except (FileNotFoundError, PermissionError):
+        return None
+
+    grupos = {"heap": 0, "stack": 0, "texto": 0, "datos": 0, "resto": 0}
+    for linea in lineas:
+        partes = linea.split(None, 5)
+        rango = partes[0]
+        perms = partes[1]
+        pathname = partes[5].strip() if len(partes) > 5 else ""
+
+        inicio_s, fin_s = rango.split("-")
+        tam_kb = (int(fin_s, 16) - int(inicio_s, 16)) // 1024
+
+        if pathname == "[heap]":
+            grupos["heap"] += tam_kb
+        elif pathname.startswith("[stack"):
+            grupos["stack"] += tam_kb
+        elif "x" in perms:
+            grupos["texto"] += tam_kb
+        elif "w" in perms and not pathname.startswith("/"):
+            grupos["datos"] += tam_kb
+        else:
+            grupos["resto"] += tam_kb
+
+    return grupos
+
+
 # ---------- THREADS (LWPs) ----------
 
 def listar_tids(pid):
@@ -120,7 +220,13 @@ def leer_stat_thread(pid, tid):
     fin = linea.rfind(')')
     comm = linea[inicio + 1:fin]
     resto = linea[fin + 2:].split()
-    return {"tid": tid, "comm": comm, "estado": resto[0]}
+    return {
+        "tid": tid,
+        "comm": comm,
+        "estado": resto[0],
+        "utime": int(resto[11]),
+        "stime": int(resto[12]),
+    }
 
 
 def leer_ctxt_switches(pid, tid):
@@ -196,8 +302,8 @@ def leer_fds(pid):
     proceso no es tuyo (ni corrés como root), esto puede dar PermissionError,
     que se trata igual que "no pude leerlo" y no como un crash.
 
-    Devuelve (cantidad_total, conteo_por_tipo), donde tipo es uno de:
-    'archivo', 'socket', 'pipe', 'anon_inode', 'otro'.
+    Devuelve total, conteo_por_tipo, y la LISTA detallada (fd, tipo, destino)
+    que pide la consigna para la vista de File Descriptors.
     """
     ruta = f"{PROC}/{pid}/fd"
     try:
@@ -206,21 +312,27 @@ def leer_fds(pid):
         return None
 
     conteo = {"archivo": 0, "socket": 0, "pipe": 0, "anon_inode": 0, "otro": 0}
-    for fd in entradas:
+    detalle = []
+    for fd in sorted(entradas, key=lambda x: int(x)):
         try:
             destino = os.readlink(f"{ruta}/{fd}")
         except (FileNotFoundError, PermissionError):
             continue  # el FD se cerró entre el listado y la lectura (TOCTOU otra vez)
 
         if destino.startswith("socket:"):
-            conteo["socket"] += 1
+            tipo = "socket"
         elif destino.startswith("pipe:"):
-            conteo["pipe"] += 1
+            tipo = "pipe"
         elif destino.startswith("anon_inode:"):
-            conteo["anon_inode"] += 1
+            tipo = "anon_inode"
+        elif destino.startswith("/dev/pts") or destino.startswith("/dev/tty"):
+            tipo = "tty"
         elif destino.startswith("/"):
-            conteo["archivo"] += 1
+            tipo = "archivo"
         else:
-            conteo["otro"] += 1
+            tipo = "otro"
 
-    return {"total": len(entradas), "por_tipo": conteo}
+        conteo[tipo] = conteo.get(tipo, 0) + 1
+        detalle.append({"fd": int(fd), "tipo": tipo, "destino": destino})
+
+    return {"total": len(entradas), "por_tipo": conteo, "detalle": detalle}
