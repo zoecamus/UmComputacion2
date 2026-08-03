@@ -1,0 +1,12 @@
+{
+    "intervalos": {
+      "recolector": 1.0,
+      "resumen": 2.0,
+      "memoria": 3.0,
+      "sistema": 2.0,
+      "threads": 2.0,
+      "senales": 10.0,
+      "fds": 5.0,
+      "scheduling": 10.0
+    }
+  }

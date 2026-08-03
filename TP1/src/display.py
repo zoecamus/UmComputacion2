@@ -115,7 +115,7 @@ def _dibujar_ayuda(stdscr):
     win.getch()
 
 
-def run(stdscr, snapshot, intervalos, evento_stop):
+def run(stdscr, snapshot, intervalos, evento_stop, modo_verbose=None):
     curses.curs_set(0)
     stdscr.timeout(300)  # no bloqueante: refresca solo aunque no haya tecla
 
@@ -186,13 +186,13 @@ def run(stdscr, snapshot, intervalos, evento_stop):
             cursor_pid = pids_visibles[0]
 
         _dibujar(stdscr, snapshot, intervalos, vista_idx, lista, cursor_pid,
-                 pid_pineado, orden, filtro_comm, filtro_user)
+                 pid_pineado, orden, filtro_comm, filtro_user, modo_verbose)
 
     return
 
 
 def _dibujar(stdscr, snapshot, intervalos, vista_idx, lista, cursor_pid,
-              pid_pineado, orden, filtro_comm, filtro_user):
+              pid_pineado, orden, filtro_comm, filtro_user, modo_verbose=None):
     stdscr.erase()
     altura, ancho = stdscr.getmaxyx()
     numero, letra, titulo, clave, intervalo_min = VISTAS[vista_idx]
@@ -209,6 +209,8 @@ def _dibujar(stdscr, snapshot, intervalos, vista_idx, lista, cursor_pid,
         pass
 
     info_extra = f"orden={orden} intervalo={intervalos[clave].value:.1f}s(min {intervalo_min})"
+    if modo_verbose is not None and modo_verbose.value:
+        info_extra += " [VERBOSE]"
     if filtro_comm:
         info_extra += f" filtro_cmd='{filtro_comm}'"
     if filtro_user:

@@ -4,20 +4,26 @@ import os
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 import procfs
+import ipc
 
 
-def correr(snapshot, intervalo, evento_stop):
+def correr(snapshot, intervalo, evento_stop, cola_pids):
     """
     CPU% global se calcula por DELTA de jiffies entre dos lecturas
-    consecutivas de /proc/stat, no de una lectura sola (una sola lectura
-    solo te da un acumulado desde el boot, no un porcentaje "ahora").
+    consecutivas de /proc/stat (una sola lectura da un acumulado desde
+    el boot, no un porcentaje "ahora"). El conteo de procesos por estado
+    SÍ usa la lista del recolector (vía cola_pids), en vez de listar
+    /proc otra vez por su cuenta.
     """
     anterior = procfs.leer_cpu_global()
+    pids_actuales = procfs.listar_pids()  # bootstrap
 
     while not evento_stop.is_set():
         evento_stop.wait(intervalo.value)
         if evento_stop.is_set():
             break
+
+        pids_actuales = ipc.pids_mas_recientes(cola_pids, pids_actuales)
 
         actual = procfs.leer_cpu_global()
         delta_total = sum(actual.values()) - sum(anterior.values())
@@ -31,14 +37,11 @@ def correr(snapshot, intervalo, evento_stop):
         load1, load5, load15 = procfs.leer_loadavg()
         uptime_seg, btime = procfs.leer_uptime_boot()
 
-        # Conteo de procesos por estado y threads totales: recorremos
-        # /proc de nuevo acá (independiente del analizador resumen, que
-        # corre en su propio proceso con su propio intervalo).
         por_estado = {}
         threads_totales = 0
         zombies = 0
         total_procesos = 0
-        for pid in procfs.listar_pids():
+        for pid in pids_actuales:
             info = procfs.leer_stat(pid)
             if info is None:
                 continue

@@ -4,12 +4,16 @@ import os
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 import procfs
+import ipc
 
 
-def correr(snapshot, intervalo, evento_stop):
+def correr(snapshot, intervalo, evento_stop, cola_pids):
+    pids_actuales = procfs.listar_pids()  # bootstrap
+
     while not evento_stop.is_set():
+        pids_actuales = ipc.pids_mas_recientes(cola_pids, pids_actuales)
         datos = {}
-        for pid in procfs.listar_pids():
+        for pid in pids_actuales:
             status = procfs.leer_status(pid)
             if status is None:
                 continue
@@ -27,7 +31,7 @@ def correr(snapshot, intervalo, evento_stop):
                 "vm_swap_kb": status["vm_swap_kb"],
                 "minflt": stat["minflt"] if stat else 0,
                 "majflt": stat["majflt"] if stat else 0,
-                "segmentos": segmentos,  # dict heap/stack/texto/datos/resto en KB, o None
+                "segmentos": segmentos,
             }
 
         snapshot["memoria"] = {"datos": datos, "ts": time.time()}

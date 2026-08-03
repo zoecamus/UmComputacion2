@@ -4,28 +4,32 @@ import sys
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 import procfs
+import ipc
 
 HZ = os.sysconf("SC_CLK_TCK")  # clock ticks por segundo del kernel (típicamente 100)
 
 
-def correr(snapshot, intervalo, evento_stop):
+def correr(snapshot, intervalo, evento_stop, cola_pids):
     """
+    Ya NO llama a procfs.listar_pids() por su cuenta: recibe la lista de
+    PIDs del recolector vía Queue (patrón mailbox, ver ipc.py). El
+    bootstrap inicial (antes de que el recolector publique su primera
+    lista) usa una lectura directa como fallback, para no arrancar vacío.
+
     Además de PID/PPID/estado/threads, calcula CPU% por proceso comparando
-    (utime+stime) de esta lectura contra la anterior -- mismo principio que
-    el CPU global de sistema.py, pero por proceso. Necesita recordar el
-    valor anterior de cada PID entre vueltas del loop (variable `anteriores`
-    en el closure de esta función, vive mientras el proceso analizador
-    esté vivo).
+    (utime+stime) de esta lectura contra la anterior.
     """
     anteriores = {}  # pid -> (utime+stime en jiffies, timestamp de esa lectura)
+    pids_actuales = procfs.listar_pids()  # bootstrap, solo la primera vez
 
     while not evento_stop.is_set():
+        pids_actuales = ipc.pids_mas_recientes(cola_pids, pids_actuales)
         ahora = time.time()
         datos = {}
-        for pid in procfs.listar_pids():
+        for pid in pids_actuales:
             info = procfs.leer_stat(pid)
             if info is None:
-                continue  # murió entre el listado y la lectura
+                continue  # murió entre el listado del recolector y esta lectura
             status = procfs.leer_status(pid)
 
             cpu_actual = info["utime"] + info["stime"]
@@ -50,9 +54,6 @@ def correr(snapshot, intervalo, evento_stop):
                 "usuario": procfs.resolver_usuario(uid),
             }
 
-        # Limpieza: sacar de `anteriores` los PIDs que ya no existen,
-        # para no acumular memoria indefinidamente en un analizador que
-        # corre para siempre.
         for pid_viejo in list(anteriores.keys()):
             if pid_viejo not in datos:
                 del anteriores[pid_viejo]
