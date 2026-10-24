@@ -1,40 +1,43 @@
-import time
-import uuid
+import logging
+from contextlib import asynccontextmanager
 from typing import Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
 
 from modelos import Estado, TareaCrear
+from plataforma import NUM_WORKERS, Plataforma
 
-app = FastAPI(title="Plataforma de Tareas Distribuidas")
+logging.basicConfig(level=logging.INFO)
 
-# Etapa 1: todo el estado es este dict, en memoria. Todavía no hay cola ni
-# workers, así que ninguna tarea se ejecuta: solo se registran.
-tareas: dict[str, dict] = {}
+plataforma = Plataforma(NUM_WORKERS)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Lo que está antes del yield corre al ARRANCAR el servidor; lo de
+    # después, al apagarlo. Los workers tienen que nacer acá adentro porque
+    # necesitan el event loop de uvicorn ya andando.
+    plataforma.iniciar()
+    yield
+    await plataforma.detener()
+
+
+app = FastAPI(title="Plataforma de Tareas Distribuidas", lifespan=lifespan)
 
 
 @app.post("/tareas", status_code=201)
 async def crear_tarea(datos: TareaCrear):
-    id_tarea = str(uuid.uuid4())
-    tareas[id_tarea] = {
-        "id": id_tarea,
-        "tipo": datos.tipo,
-        "parametros": datos.parametros,
-        "timeout_s": datos.timeout_s,
-        "estado": Estado.PENDIENTE,
-        "resultado": None,
-        "error": None,
-        "creada_en": time.time(),
-    }
-    return tareas[id_tarea]
+    # Solo registra y encola: responde al instante, sin esperar a que la
+    # tarea se ejecute.
+    return plataforma.encolar(datos.tipo, datos.parametros, datos.timeout_s)
 
 
 @app.get("/tareas")
 async def listar_tareas(estado: Optional[Estado] = None):
     # `estado` es un query param opcional: GET /tareas?estado=pendiente
     # Si mandan un valor que no está en el Enum, FastAPI responde 422.
-    todas = list(tareas.values())
+    todas = list(plataforma.tareas.values())
     if estado is not None:
         todas = [t for t in todas if t["estado"] == estado]
     return todas
@@ -42,34 +45,33 @@ async def listar_tareas(estado: Optional[Estado] = None):
 
 @app.get("/tareas/{id_tarea}")
 async def obtener_tarea(id_tarea: str):
-    if id_tarea not in tareas:
+    if id_tarea not in plataforma.tareas:
         raise HTTPException(status_code=404, detail="Tarea no encontrada")
-    return tareas[id_tarea]
+    return plataforma.tareas[id_tarea]
 
 
 @app.delete("/tareas/{id_tarea}")
 async def cancelar_tarea(id_tarea: str):
-    # Placeholder de la etapa 1: solo cambia el estado en el dict.
-    # La cancelación real (de una corrutina en ejecución) es la etapa 5.
-    if id_tarea not in tareas:
+    if id_tarea not in plataforma.tareas:
         raise HTTPException(status_code=404, detail="Tarea no encontrada")
-    if tareas[id_tarea]["estado"] in (Estado.PENDIENTE, Estado.EJECUTANDO):
-        tareas[id_tarea]["estado"] = Estado.CANCELADA
-    return tareas[id_tarea]
+    tarea = plataforma.tareas[id_tarea]
+
+    if tarea["estado"] == Estado.PENDIENTE:
+        # Sigue en la cola: el worker la va a saltear cuando la saque.
+        tarea["estado"] = Estado.CANCELADA
+    elif tarea["estado"] == Estado.EJECUTANDO:
+        # Cancelar una corrutina en ejecución es la etapa 5. Hasta entonces
+        # lo decimos explícitamente en vez de fingir que anduvo.
+        raise HTTPException(
+            status_code=409,
+            detail="Cancelar una tarea en ejecución todavía no está implementado",
+        )
+    return tarea
 
 
 @app.get("/estadisticas")
 async def estadisticas():
-    por_estado = {e.value: 0 for e in Estado}
-    for t in tareas.values():
-        por_estado[t["estado"].value] += 1
-    return {
-        "total": len(tareas),
-        "por_estado": por_estado,
-        # Datos falsos por ahora: no hay workers ni tareas terminadas.
-        "tiempo_promedio_s": None,
-        "workers_ocupados": 0,
-    }
+    return plataforma.estadisticas()
 
 
 if __name__ == "__main__":
