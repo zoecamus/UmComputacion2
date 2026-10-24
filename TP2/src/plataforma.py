@@ -4,6 +4,8 @@ import os
 import time
 import uuid
 
+import httpx
+
 from modelos import Estado
 
 log = logging.getLogger("plataforma")
@@ -127,6 +129,75 @@ class Plataforma:
             # time.sleep acá congelaría la API entera.
             await asyncio.sleep(segundos)
             return {"esperado_s": segundos}
+        if tarea["tipo"] == "descargar":
+            return await self._descargar(tarea["parametros"])
         raise NotImplementedError(
             f"el tipo '{tarea['tipo']}' todavía no está implementado"
         )
+
+    # ---------- tipos de tarea ----------
+
+    async def _descargar(self, parametros: dict) -> dict:
+        urls = parametros["urls"]
+        secuencial = parametros.get("secuencial", False)
+        t0 = time.perf_counter()
+
+        # Un solo cliente para todas las URLs: comparte el pool de
+        # conexiones. El timeout de 10 s por request es PROVISORIO: evita que
+        # un servidor colgado retenga al worker para siempre. El timeout real
+        # de la tarea (timeout_s) se aplica en la etapa 5.
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as cliente:
+            if secuencial:
+                # Cada await espera a que termine la descarga ANTERIOR
+                # antes de arrancar la siguiente: tarda la SUMA de todas.
+                descargas = []
+                for u in urls:
+                    descargas.append(await self._bajar(cliente, u))
+            else:
+                # gather arranca todas las corrutinas a la vez y espera a
+                # que terminen todas: tarda lo que tarde la MÁS LENTA.
+                descargas = await asyncio.gather(
+                    *(self._bajar(cliente, u) for u in urls)
+                )
+
+        exitosas = sum(1 for d in descargas if d["ok"])
+        if exitosas == 0:
+            # Si no se pudo bajar NINGUNA, la tarea falla. Si se bajó al
+            # menos una, se considera completada y el detalle por URL
+            # muestra cuáles fallaron.
+            raise RuntimeError(
+                f"no se pudo descargar ninguna de las {len(urls)} URLs: "
+                f"{descargas[0]['error']}"
+            )
+        return {
+            "modo": "secuencial" if secuencial else "concurrente",
+            "total_urls": len(urls),
+            "exitosas": exitosas,
+            "fallidas": len(urls) - exitosas,
+            "tiempo_total_s": round(time.perf_counter() - t0, 3),
+            "descargas": descargas,
+        }
+
+    @staticmethod
+    async def _bajar(cliente: httpx.AsyncClient, url: str) -> dict:
+        """Descarga UNA url. Nunca lanza HTTPError: lo convierte en datos,
+        así un fallo no cancela al resto dentro del gather.
+        'ok' significa que llegó una respuesta HTTP (aunque sea un 404);
+        'ok': False significa error de red (DNS, conexión, timeout...)."""
+        t0 = time.perf_counter()
+        try:
+            r = await cliente.get(url)
+            return {
+                "url": url,
+                "ok": True,
+                "status": r.status_code,
+                "bytes": len(r.content),
+                "tiempo_s": round(time.perf_counter() - t0, 3),
+            }
+        except httpx.HTTPError as e:
+            return {
+                "url": url,
+                "ok": False,
+                "error": f"{type(e).__name__}: {e}",
+                "tiempo_s": round(time.perf_counter() - t0, 3),
+            }

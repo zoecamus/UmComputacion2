@@ -23,12 +23,30 @@ class TareaCrear(BaseModel):
 
     @model_validator(mode="after")
     def validar_parametros(self):
-        # Etapa 2: solo validamos 'esperar'. Los parámetros de 'descargar' y
-        # 'hashear' se validan cuando implementemos esos tipos.
+        # Validamos 'esperar' y 'descargar'. Los parámetros de 'hashear' se
+        # validan cuando lo implementemos (etapa 4).
         if self.tipo == "esperar":
             s = self.parametros.get("segundos")
             if isinstance(s, bool) or not isinstance(s, (int, float)) or s < 0:
                 raise ValueError(
                     "'esperar' requiere parametros.segundos: un número >= 0"
                 )
+        elif self.tipo == "descargar":
+            urls = self.parametros.get("urls")
+            if (
+                not isinstance(urls, list)
+                or not urls
+                or not all(
+                    isinstance(u, str) and u.startswith(("http://", "https://"))
+                    for u in urls
+                )
+            ):
+                raise ValueError(
+                    "'descargar' requiere parametros.urls: una lista no vacía "
+                    "de URLs que empiecen con http:// o https://"
+                )
+            # 'secuencial' es opcional: existe solo para poder medir la
+            # diferencia contra la versión concurrente (medición 1).
+            if not isinstance(self.parametros.get("secuencial", False), bool):
+                raise ValueError("parametros.secuencial debe ser true o false")
         return self
