@@ -54,19 +54,8 @@ async def obtener_tarea(id_tarea: str):
 async def cancelar_tarea(id_tarea: str):
     if id_tarea not in plataforma.tareas:
         raise HTTPException(status_code=404, detail="Tarea no encontrada")
-    tarea = plataforma.tareas[id_tarea]
-
-    if tarea["estado"] == Estado.PENDIENTE:
-        # Sigue en la cola: el worker la va a saltear cuando la saque.
-        tarea["estado"] = Estado.CANCELADA
-    elif tarea["estado"] == Estado.EJECUTANDO:
-        # Cancelar una corrutina en ejecución es la etapa 5. Hasta entonces
-        # lo decimos explícitamente en vez de fingir que anduvo.
-        raise HTTPException(
-            status_code=409,
-            detail="Cancelar una tarea en ejecución todavía no está implementado",
-        )
-    return tarea
+    # Pendiente o en ejecución: se cancela. Ya terminada: se devuelve igual.
+    return plataforma.cancelar(id_tarea)
 
 
 @app.get("/estadisticas")

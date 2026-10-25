@@ -1,12 +1,3 @@
-"""Medición 2 del TP2: tarea CPU-bound SIN executor vs CON executor.
-
-Mientras una tarea `hashear` corre, el script le pide GET /tareas a la API
-una y otra vez y anota cuánto tarda cada respuesta. Si el event loop está
-bloqueado, esas respuestas se demoran.
-
-    python3 scripts/medir_cpu.py
-    python3 scripts/medir_cpu.py --iteraciones 10000000
-"""
 import argparse
 import json
 import time

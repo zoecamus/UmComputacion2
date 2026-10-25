@@ -8,12 +8,17 @@ from concurrent.futures import ProcessPoolExecutor
 import httpx
 
 from modelos import Estado
-from tareas_cpu import hash_iterado
+from tareas_cpu import hash_iterado, hash_paso
 
 log = logging.getLogger("plataforma")
 
 # Cantidad de workers configurable por variable de entorno (default 3).
 NUM_WORKERS = int(os.environ.get("NUM_WORKERS", "3"))
+
+# Iteraciones de hash por cada viaje al executor (~0,2 s en una máquina
+# normal). Más chico = se cancela más rápido pero hay más viajes entre
+# procesos; más grande = al revés.
+PASO_HASH = 500_000
 
 
 class Plataforma:
@@ -32,6 +37,10 @@ class Plataforma:
         self.workers: list[asyncio.Task] = []
         self.ocupados = 0
         self.executor: ProcessPoolExecutor | None = None
+        # id -> asyncio.Task del trabajo que se está ejecutando AHORA.
+        self.en_curso: dict[str, asyncio.Task] = {}
+        # ids que recibieron un DELETE mientras se ejecutaban.
+        self._cancelando: set[str] = set()
 
     # ---------- ciclo de vida ----------
 
@@ -116,20 +125,73 @@ class Plataforma:
         if tarea["estado"] != Estado.PENDIENTE:
             return  # la cancelaron mientras esperaba en la cola
 
+        id_tarea = tarea["id"]
         self.ocupados += 1
         tarea["estado"] = Estado.EJECUTANDO
         tarea["inicio_en"] = time.time()
+
+        # El trabajo real corre en SU PROPIA asyncio.Task, separada del
+        # worker. Así se puede cancelar el trabajo (trabajo.cancel()) sin
+        # matar al worker, que tiene que seguir vivo para la próxima tarea.
+        # No hay ningún `await` entre cambiar el estado a EJECUTANDO y
+        # guardar la task en en_curso, así que cancelar() nunca ve un estado
+        # EJECUTANDO sin su task.
+        trabajo = asyncio.create_task(self._ejecutar(tarea), name=f"tarea-{id_tarea[:8]}")
+        self.en_curso[id_tarea] = trabajo
         try:
-            tarea["resultado"] = await self._ejecutar(tarea)
+            # El timeout cuenta desde que la tarea EMPIEZA a ejecutarse, no
+            # desde que se encoló. Al vencer, asyncio.timeout cancela esta
+            # corrutina (el worker), esa cancelación se propaga a `trabajo`
+            # (que es lo que está esperando) y el `with` la convierte en un
+            # TimeoutError.
+            async with asyncio.timeout(tarea["timeout_s"]):
+                tarea["resultado"] = await trabajo
             tarea["estado"] = Estado.COMPLETADA
+        except TimeoutError:
+            tarea["estado"] = Estado.FALLIDA
+            tarea["error"] = f"TimeoutError: superó el timeout de {tarea['timeout_s']} s"
+        except asyncio.CancelledError:
+            # Hay DOS motivos posibles para llegar acá y hay que distinguirlos:
+            #  - alguien hizo DELETE: cancelar() canceló `trabajo`. El worker
+            #    NO fue cancelado, sigue vivo.
+            #  - se está apagando el servidor: detener() canceló al worker.
+            # CancelledError hereda de BaseException, así que `except
+            # Exception` no la agarra; hay que pedirla explícitamente.
+            if id_tarea in self._cancelando:
+                tarea["estado"] = Estado.CANCELADA
+            else:
+                raise  # apagado: dejamos que el worker muera (ver finally)
         except Exception as e:
             # Una tarea que falla NO tiene que tumbar al worker: la marcamos
             # fallida con el motivo y el worker pasa a la siguiente.
             tarea["estado"] = Estado.FALLIDA
             tarea["error"] = f"{type(e).__name__}: {e}"
         finally:
+            self.en_curso.pop(id_tarea, None)
+            self._cancelando.discard(id_tarea)
             tarea["fin_en"] = time.time()
             self.ocupados -= 1
+
+    def cancelar(self, id_tarea: str) -> dict:
+        """Cancela una tarea según su estado. Es síncrona (sin await): el
+        cambio de estado y el cancel() ocurren juntos, sin que el event loop
+        pueda meter a otra corrutina en el medio."""
+        tarea = self.tareas[id_tarea]
+        if tarea["estado"] == Estado.PENDIENTE:
+            # Sigue en la cola: el worker la va a saltear cuando la saque.
+            tarea["estado"] = Estado.CANCELADA
+            tarea["fin_en"] = time.time()
+        elif tarea["estado"] == Estado.EJECUTANDO:
+            # Marcamos ANTES de cancelar para que _procesar sepa que fue un
+            # DELETE y no un apagado. Después task.cancel() inyecta
+            # CancelledError en el punto donde `trabajo` está esperando
+            # (un sleep, una request de red, un run_in_executor...).
+            self._cancelando.add(id_tarea)
+            tarea["estado"] = Estado.CANCELADA
+            self.en_curso[id_tarea].cancel()
+        # Si ya terminó (completada, fallida o cancelada), no hay nada que
+        # hacer: se devuelve tal cual.
+        return tarea
 
     async def _ejecutar(self, tarea: dict):
         if tarea["tipo"] == "esperar":
@@ -160,12 +222,25 @@ class Plataforma:
             # el loop no atiende a nadie: ni la API ni los otros workers.
             resultado = hash_iterado(texto, n)
         else:
-            # Se manda el trabajo a otro PROCESO y se hace `await` del
-            # resultado. El event loop queda libre mientras tanto.
+            # El trabajo va a otro PROCESO y se hace `await` del resultado:
+            # el event loop queda libre mientras tanto.
+            #
+            # Se manda en PEDAZOS de PASO_HASH iteraciones, no todo junto.
+            # Motivo: cancelar el `await` de run_in_executor NO detiene al
+            # proceso hijo si ya está calculando; seguiría quemando CPU hasta
+            # terminar. Entre pedazo y pedazo hay un `await`, que es un punto
+            # donde la cancelación y el timeout pueden entrar. Lo máximo que
+            # se desperdicia al cancelar es UN pedazo (~0,2 s).
             loop = asyncio.get_running_loop()
-            resultado = await loop.run_in_executor(
-                self.executor, hash_iterado, texto, n
-            )
+            estado = texto.encode()
+            restantes = n
+            while restantes > 0:
+                paso = min(PASO_HASH, restantes)
+                estado = await loop.run_in_executor(
+                    self.executor, hash_paso, estado, paso
+                )
+                restantes -= paso
+            resultado = estado.hex()
 
         return {
             "modo": "bloqueante" if bloqueante else "executor",
@@ -180,9 +255,9 @@ class Plataforma:
         t0 = time.perf_counter()
 
         # Un solo cliente para todas las URLs: comparte el pool de
-        # conexiones. El timeout de 10 s por request es PROVISORIO: evita que
-        # un servidor colgado retenga al worker para siempre. El timeout real
-        # de la tarea (timeout_s) se aplica en la etapa 5.
+        # conexiones. El timeout de 10 s es POR REQUEST (red); el timeout de
+        # la tarea completa (timeout_s) lo aplica _procesar. Si se cancela la
+        # tarea, el `async with` cierra el cliente y sus conexiones solo.
         async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as cliente:
             if secuencial:
                 # Cada await espera a que termine la descarga ANTERIOR
