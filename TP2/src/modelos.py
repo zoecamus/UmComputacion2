@@ -23,8 +23,7 @@ class TareaCrear(BaseModel):
 
     @model_validator(mode="after")
     def validar_parametros(self):
-        # Validamos 'esperar' y 'descargar'. Los parámetros de 'hashear' se
-        # validan cuando lo implementemos (etapa 4).
+        # Validamos los parámetros de los tres tipos.
         if self.tipo == "esperar":
             s = self.parametros.get("segundos")
             if isinstance(s, bool) or not isinstance(s, (int, float)) or s < 0:
@@ -49,4 +48,18 @@ class TareaCrear(BaseModel):
             # diferencia contra la versión concurrente (medición 1).
             if not isinstance(self.parametros.get("secuencial", False), bool):
                 raise ValueError("parametros.secuencial debe ser true o false")
+        elif self.tipo == "hashear":
+            texto = self.parametros.get("texto")
+            n = self.parametros.get("iteraciones")
+            if not isinstance(texto, str):
+                raise ValueError("'hashear' requiere parametros.texto: un string")
+            if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+                raise ValueError(
+                    "'hashear' requiere parametros.iteraciones: un entero >= 1"
+                )
+            # 'bloqueante' es opcional: corre el hash DIRECTO en el event
+            # loop, sin executor. Existe solo para la medición 2 (ver qué
+            # pasa con la API cuando se bloquea el loop).
+            if not isinstance(self.parametros.get("bloqueante", False), bool):
+                raise ValueError("parametros.bloqueante debe ser true o false")
         return self

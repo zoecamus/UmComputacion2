@@ -1,14 +1,3 @@
-"""Medición 1 del TP2: N descargas secuenciales vs N descargas concurrentes.
-
-Usa solo la librería estándar, así corre en tu máquina sin instalar nada.
-Necesita la API levantada (docker compose up --build).
-
-    python3 scripts/medir_descargas.py
-    python3 scripts/medir_descargas.py --n 20 --url https://httpbin.org/delay/1
-
-Las dos tareas se corren UNA DESPUÉS DE LA OTRA (no a la vez), para que no
-compitan por la red y la comparación sea justa.
-"""
 import argparse
 import json
 import time

@@ -3,10 +3,12 @@ import logging
 import os
 import time
 import uuid
+from concurrent.futures import ProcessPoolExecutor
 
 import httpx
 
 from modelos import Estado
+from tareas_cpu import hash_iterado
 
 log = logging.getLogger("plataforma")
 
@@ -29,6 +31,7 @@ class Plataforma:
         self.cola: asyncio.Queue | None = None
         self.workers: list[asyncio.Task] = []
         self.ocupados = 0
+        self.executor: ProcessPoolExecutor | None = None
 
     # ---------- ciclo de vida ----------
 
@@ -36,6 +39,10 @@ class Plataforma:
         # La cola se crea acá y no en __init__ para que nazca dentro del
         # event loop que la va a usar.
         self.cola = asyncio.Queue()
+        # Procesos separados para las tareas CPU-bound. Un proceso por
+        # worker: así, si todos los workers hashean a la vez, cada uno tiene
+        # su proceso. Los procesos se crean recién al primer uso.
+        self.executor = ProcessPoolExecutor(max_workers=self.num_workers)
         self.workers = [
             asyncio.create_task(self._worker(), name=f"worker-{i}")
             for i in range(self.num_workers)
@@ -49,6 +56,8 @@ class Plataforma:
         for w in self.workers:
             w.cancel()
         await asyncio.gather(*self.workers, return_exceptions=True)
+        # No esperamos a los procesos hijos: apagado bruto. Ver etapa 6.
+        self.executor.shutdown(wait=False, cancel_futures=True)
 
     # ---------- API hacia main.py ----------
 
@@ -131,11 +140,39 @@ class Plataforma:
             return {"esperado_s": segundos}
         if tarea["tipo"] == "descargar":
             return await self._descargar(tarea["parametros"])
+        if tarea["tipo"] == "hashear":
+            return await self._hashear(tarea["parametros"])
         raise NotImplementedError(
             f"el tipo '{tarea['tipo']}' todavía no está implementado"
         )
 
     # ---------- tipos de tarea ----------
+
+    async def _hashear(self, parametros: dict) -> dict:
+        texto = parametros["texto"]
+        n = parametros["iteraciones"]
+        bloqueante = parametros.get("bloqueante", False)
+        t0 = time.perf_counter()
+
+        if bloqueante:
+            # MAL A PROPÓSITO (solo para medir): el hash corre en el hilo del
+            # event loop y no hay ningún `await` en el medio. Mientras dura,
+            # el loop no atiende a nadie: ni la API ni los otros workers.
+            resultado = hash_iterado(texto, n)
+        else:
+            # Se manda el trabajo a otro PROCESO y se hace `await` del
+            # resultado. El event loop queda libre mientras tanto.
+            loop = asyncio.get_running_loop()
+            resultado = await loop.run_in_executor(
+                self.executor, hash_iterado, texto, n
+            )
+
+        return {
+            "modo": "bloqueante" if bloqueante else "executor",
+            "iteraciones": n,
+            "hash": resultado,
+            "tiempo_s": round(time.perf_counter() - t0, 3),
+        }
 
     async def _descargar(self, parametros: dict) -> dict:
         urls = parametros["urls"]
