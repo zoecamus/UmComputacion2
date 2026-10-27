@@ -5,3 +5,13 @@ services:
       - "8000:8000"
     environment:
       - NUM_WORKERS=3
+      # Cuánto espera el servidor a las tareas en curso al apagarse.
+      # Tiene que ser menor que stop_grace_period.
+      - SHUTDOWN_TIMEOUT_S=20
+    volumes:
+      # Los volcados estado_*.json se escriben en ./datos del host. Sin
+      # volumen, se perderían cuando el contenedor se recrea.
+      - ./datos:/app/datos
+    # Tiempo que Docker espera tras mandar SIGTERM antes de matar con SIGKILL.
+    # El default es 10 s, que no alcanza para esperar tareas y volcar.
+    stop_grace_period: 30s

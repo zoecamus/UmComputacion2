@@ -1,19 +1,31 @@
 import asyncio
+import glob
+import json
 import logging
 import os
 import time
 import uuid
 from concurrent.futures import ProcessPoolExecutor
+from datetime import datetime, timezone
 
 import httpx
 
 from modelos import Estado
-from tareas_cpu import hash_iterado, hash_paso
+from tareas_cpu import hash_iterado, hash_paso, ignorar_sigint
 
 log = logging.getLogger("plataforma")
 
 # Cantidad de workers configurable por variable de entorno (default 3).
 NUM_WORKERS = int(os.environ.get("NUM_WORKERS", "3"))
+
+# Cuánto esperamos a las tareas en curso al apagar. Tiene que ser MENOR que
+# el stop_grace_period de docker-compose (30 s): si no, Docker manda SIGKILL
+# antes de que alcancemos a volcar el estado.
+SHUTDOWN_TIMEOUT_S = float(os.environ.get("SHUTDOWN_TIMEOUT_S", "20"))
+
+# Carpeta donde se escriben (y se buscan al arrancar) los volcados. En Docker
+# es un volumen, para que sobrevivan a que el contenedor se recree.
+DIR_VOLCADOS = os.environ.get("DIR_VOLCADOS", "datos")
 
 # Iteraciones de hash por cada viaje al executor (~0,2 s en una máquina
 # normal). Más chico = se cancela más rápido pero hay más viajes entre
@@ -41,6 +53,13 @@ class Plataforma:
         self.en_curso: dict[str, asyncio.Task] = {}
         # ids que recibieron un DELETE mientras se ejecutaban.
         self._cancelando: set[str] = set()
+        # Apagado: True desde que llega la señal. Con esto en True no se
+        # aceptan tareas nuevas ni los workers arrancan las que quedan en cola.
+        self.cerrando = False
+        self._apagando = False  # para que apagar() corra una sola vez
+        # Se "prende" cuando NO hay ninguna tarea ejecutándose. Permite
+        # esperar "hasta que se libere el pool" sin dar vueltas preguntando.
+        self._libres: asyncio.Event | None = None
 
     # ---------- ciclo de vida ----------
 
@@ -48,25 +67,137 @@ class Plataforma:
         # La cola se crea acá y no en __init__ para que nazca dentro del
         # event loop que la va a usar.
         self.cola = asyncio.Queue()
+        self._libres = asyncio.Event()
+        self._libres.set()  # al arrancar no hay nada ejecutándose
         # Procesos separados para las tareas CPU-bound. Un proceso por
         # worker: así, si todos los workers hashean a la vez, cada uno tiene
         # su proceso. Los procesos se crean recién al primer uso.
-        self.executor = ProcessPoolExecutor(max_workers=self.num_workers)
+        # `initializer` hace que los hijos ignoren Ctrl+C (ver tareas_cpu).
+        self.executor = ProcessPoolExecutor(
+            max_workers=self.num_workers, initializer=ignorar_sigint
+        )
         self.workers = [
             asyncio.create_task(self._worker(), name=f"worker-{i}")
             for i in range(self.num_workers)
         ]
         log.info("Pool iniciado con %d workers", self.num_workers)
+        self._reportar_volcado_previo()
+
+    async def apagar(self, limite_s: float, motivo: str = "apagado"):
+        """Apagado ORDENADO. Se puede llamar más de una vez: solo la primera
+        hace algo.
+
+        1. Deja de aceptar tareas nuevas (cerrando = True).
+        2. Espera, hasta `limite_s`, a que terminen las que están corriendo.
+        3. Las que no terminaron las cancela y las deja como 'cancelada'.
+        4. Vuelca el estado a estado_<timestamp>.json.
+
+        Las tareas que seguían 'pendiente' en la cola NO se ejecutan: quedan
+        'pendiente' en el volcado, que es lo que realmente pasó con ellas."""
+        if self._apagando:
+            return
+        self._apagando = True
+        self.cerrando = True
+        log.info(
+            "Apagado ordenado (%s): %d en ejecución, %d esperando en cola. "
+            "Espero hasta %.0f s.",
+            motivo, self.ocupados, self.cola.qsize(), limite_s,
+        )
+
+        try:
+            async with asyncio.timeout(limite_s):
+                await self._libres.wait()
+        except TimeoutError:
+            pass  # se acabó el límite; abajo cancelamos lo que quede
+
+        if self.ocupados > 0:
+            # Cancelamos con el mismo mecanismo que DELETE (cancelar()): la
+            # tarea queda 'cancelada' y el worker sigue sano. Después
+            # anotamos el motivo real.
+            restantes = list(self.en_curso)
+            log.warning(
+                "Cancelo %d tarea(s) que no terminaron a tiempo", len(restantes)
+            )
+            for id_tarea in restantes:
+                self.cancelar(id_tarea)
+                self.tareas[id_tarea]["error"] = (
+                    "interrumpida por el apagado del servidor"
+                )
+            # Damos un respiro corto para que cada cancelación termine de
+            # limpiar (cerrar conexiones, etc.) antes de volcar el estado.
+            # clear() porque dejar_de_esperar() pudo haber dejado el Event
+            # prendido aunque todavía haya tareas; sin esto la espera de
+            # abajo no esperaría nada. No hay `await` entre el for y este
+            # clear(), así que ningún worker pudo terminar en el medio.
+            self._libres.clear()
+            try:
+                async with asyncio.timeout(5):
+                    await self._libres.wait()
+            except TimeoutError:
+                log.error("Quedaron tareas sin terminar de cancelarse")
+
+        self._volcar_estado(motivo)
+
+    def dejar_de_esperar(self):
+        """Segunda señal durante el apagado: no esperar más. Despierta a
+        apagar() aunque haya tareas corriendo; ahí las cancela y vuelca."""
+        if self._libres is not None:
+            self._libres.set()
 
     async def detener(self):
-        # Etapa 2: apagado bruto, cancela los workers sin esperar a nadie.
-        # El apagado ordenado (esperar tareas en curso, volcar JSON) es la
-        # etapa 6.
+        # Se llama al final, cuando apagar() ya hizo lo importante. Acá solo
+        # se cancelan los workers (que a esta altura están ociosos esperando
+        # en cola.get()) y se libera el pool de procesos.
         for w in self.workers:
             w.cancel()
         await asyncio.gather(*self.workers, return_exceptions=True)
-        # No esperamos a los procesos hijos: apagado bruto. Ver etapa 6.
         self.executor.shutdown(wait=False, cancel_futures=True)
+
+    # ---------- persistencia ----------
+
+    def _volcar_estado(self, motivo: str):
+        ahora = datetime.now(timezone.utc)
+        nombre = f"estado_{ahora.strftime('%Y%m%d_%H%M%S')}.json"
+        os.makedirs(DIR_VOLCADOS, exist_ok=True)
+        ruta = os.path.join(DIR_VOLCADOS, nombre)
+        contenido = {
+            "generado_en": ahora.isoformat(),
+            "motivo": motivo,
+            "estadisticas": self.estadisticas(),
+            "tareas": list(self.tareas.values()),
+        }
+        # Se escribe a un archivo temporal y después se renombra. os.replace
+        # es atómico: si nos matan (SIGKILL) a mitad de la escritura, queda
+        # un .tmp sin terminar, nunca un estado_*.json cortado por la mitad.
+        # Escribir un archivo chico es bloqueante, pero tarda milisegundos y
+        # a esta altura no hay nadie más a quien atender.
+        tmp = ruta + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(contenido, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, ruta)
+        log.info("Estado volcado a %s (%d tareas)", ruta, len(self.tareas))
+
+    def _reportar_volcado_previo(self):
+        """Al arrancar: si hay un volcado de una ejecución anterior, solo lo
+        informamos por log. NO se cargan las tareas de vuelta (limitación
+        conocida, ver README)."""
+        archivos = sorted(glob.glob(os.path.join(DIR_VOLCADOS, "estado_*.json")))
+        if not archivos:
+            log.info("No hay volcados previos en %s/", DIR_VOLCADOS)
+            return
+        ultimo = archivos[-1]
+        try:
+            with open(ultimo, encoding="utf-8") as f:
+                datos = json.load(f)
+            est = datos["estadisticas"]
+            log.info(
+                "Volcado previo encontrado: %s (generado %s por %s): "
+                "%d tareas, por estado %s. Hay %d volcado(s) en total.",
+                ultimo, datos["generado_en"], datos["motivo"],
+                est["total"], est["por_estado"], len(archivos),
+            )
+        except (OSError, ValueError, KeyError) as e:
+            log.warning("Hay un volcado previo (%s) pero no se pudo leer: %s", ultimo, e)
 
     # ---------- API hacia main.py ----------
 
@@ -76,7 +207,7 @@ class Plataforma:
             "id": id_tarea,
             "tipo": tipo,
             "parametros": parametros,
-            "timeout_s": timeout_s,  # se guarda, pero todavía no se aplica
+            "timeout_s": timeout_s,
             "estado": Estado.PENDIENTE,
             "resultado": None,
             "error": None,
@@ -103,6 +234,7 @@ class Plataforma:
             "workers_total": self.num_workers,
             "workers_ocupados": self.ocupados,
             "en_cola": self.cola.qsize(),
+            "apagando": self.cerrando,
         }
 
     # ---------- workers ----------
@@ -124,9 +256,12 @@ class Plataforma:
     async def _procesar(self, tarea: dict):
         if tarea["estado"] != Estado.PENDIENTE:
             return  # la cancelaron mientras esperaba en la cola
+        if self.cerrando:
+            return  # nos estamos apagando: queda 'pendiente', no se ejecuta
 
         id_tarea = tarea["id"]
         self.ocupados += 1
+        self._libres.clear()
         tarea["estado"] = Estado.EJECUTANDO
         tarea["inicio_en"] = time.time()
 
@@ -171,6 +306,8 @@ class Plataforma:
             self._cancelando.discard(id_tarea)
             tarea["fin_en"] = time.time()
             self.ocupados -= 1
+            if self.ocupados == 0:
+                self._libres.set()  # despierta a apagar() si está esperando
 
     def cancelar(self, id_tarea: str) -> dict:
         """Cancela una tarea según su estado. Es síncrona (sin await): el
@@ -188,6 +325,7 @@ class Plataforma:
             # (un sleep, una request de red, un run_in_executor...).
             self._cancelando.add(id_tarea)
             tarea["estado"] = Estado.CANCELADA
+            tarea["fin_en"] = time.time()
             self.en_curso[id_tarea].cancel()
         # Si ya terminó (completada, fallida o cancelada), no hay nada que
         # hacer: se devuelve tal cual.

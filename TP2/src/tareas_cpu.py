@@ -1,4 +1,16 @@
 import hashlib
+import signal
+
+
+def ignorar_sigint():
+    """Se ejecuta UNA vez al nacer cada proceso hijo del executor.
+
+    Cuando el usuario aprieta Ctrl+C en la terminal, el SIGINT le llega a
+    TODO el grupo de procesos, hijos incluidos. Si los hijos murieran con
+    eso, el apagado ordenado del proceso principal se encontraría con un
+    pool roto. Los hijos ignoran SIGINT: los maneja el padre, que decide
+    cuándo parar el trabajo."""
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
 
 
 def hash_paso(estado: bytes, iteraciones: int) -> bytes:
