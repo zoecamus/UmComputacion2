@@ -4,7 +4,8 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - NUM_WORKERS=3
+      # Se puede cambiar sin editar el archivo: NUM_WORKERS=10 docker compose up -d
+      - NUM_WORKERS=${NUM_WORKERS:-3}
       # Cuánto espera el servidor a las tareas en curso al apagarse.
       # Tiene que ser menor que stop_grace_period.
       - SHUTDOWN_TIMEOUT_S=20

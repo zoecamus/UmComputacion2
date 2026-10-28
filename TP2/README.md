@@ -1,8 +1,8 @@
 # TP2 — Plataforma de Tareas Distribuidas
 
-> Trabajo en curso. Este README se va completando etapa por etapa.
+**Índice:** [Descripción](#descripción) · [Cómo correr](#cómo-correr) · [Cómo probar](#cómo-probar) · [Arquitectura](#arquitectura) · [Decisiones de diseño](#decisiones-de-diseño) · [Apagado ordenado](#apagado-ordenado) · [Mediciones](#mediciones) · [Pruebas de cancelación y timeouts](#pruebas-de-cancelación-y-timeouts) · [Conceptos del curso aplicados](#conceptos-del-curso-aplicados) · [Limitaciones conocidas](#limitaciones-conocidas) · [Lo que aprendí](#lo-que-aprendí)
 
-## Estado actual: etapa 6 (apagado ordenado y volcado a JSON)
+## Descripción
 
 La API encola tareas en una `asyncio.Queue` y un pool de N corrutinas las
 ejecuta. Los tres tipos de tarea hacen trabajo real: `esperar` (I/O
@@ -16,7 +16,6 @@ estado a `datos/estado_<timestamp>.json`.
 ## Cómo correr
 
 ```bash
-mkdir -p datos            # solo la primera vez (ver nota abajo)
 docker compose up --build
 ```
 
@@ -25,8 +24,8 @@ La API queda en `http://localhost:8000` (documentación interactiva en
 (default 3) y `SHUTDOWN_TIMEOUT_S` (default 20, cuánto espera al apagarse).
 
 Los volcados se escriben en `./datos/` del host (un volumen), así sobreviven
-aunque el contenedor se recree. Conviene crear la carpeta vos antes de la
-primera corrida: si la crea Docker, queda a nombre de root.
+aunque el contenedor se recree. La carpeta viaja en el repositorio
+(`datos/.gitkeep`); los volcados en sí no se versionan.
 
 ## Cómo probar
 
@@ -73,22 +72,32 @@ Para ver el pool trabajando, encolá 5 tareas de 2 segundos y consultá
 ## Arquitectura
 
 ```
- Cliente HTTP
-      │  POST /tareas
-      ▼
- ┌─────────────┐   put_nowait(id)   ┌─────────────────┐
- │ API FastAPI │ ─────────────────> │  asyncio.Queue  │
- └─────────────┘                    └────────┬────────┘
-      ▲                                      │ get()
-      │ lee el dict                          ▼
-      │                         ┌──────────────────────────┐
-      └──────────────────────── │ N workers (corrutinas)   │
-           tareas{id: estado}   │ pendiente → ejecutando → │
-                                │ completada | fallida     │
-                                └──────────────────────────┘
+ Cliente HTTP ── POST / GET / DELETE /tareas ──> API FastAPI (event loop, 1 hilo)
+                                                    │ put_nowait(id)      ▲ lee y escribe
+                                                    ▼                     │ tareas{id: estado}
+                                              asyncio.Queue               │
+                                                    │ get()               │
+                                                    ▼                     │
+                                     N workers (corrutinas) ──────────────┘
+                                     create_task(_ejecutar) + asyncio.timeout
+                                       │              │                │
+                                    esperar        descargar         hashear
+                                 asyncio.sleep    httpx (async)   run_in_executor
+                                                                       │
+                                                                       ▼
+                                                      ProcessPoolExecutor (procesos hijos)
+
+ Estados:  pendiente ──> ejecutando ──> completada
+                                   ├──> fallida    (error o timeout)
+                                   └──> cancelada  (DELETE o apagado)
+
+ SIGTERM / SIGINT ──> apagar(): 503 a POST, espera con límite, vuelca datos/estado_*.json
 ```
 
-Todo vive en un solo proceso y un solo hilo (el event loop de uvicorn).
+La API, la cola y los workers viven en un solo proceso y un solo hilo (el
+event loop de uvicorn). Las tareas de I/O (`esperar`, `descargar`) también
+corren en ese hilo, como corrutinas. Solo las tareas CPU-bound (`hashear`)
+salen a **procesos hijos**.
 
 ## Decisiones de diseño
 
@@ -96,10 +105,16 @@ Todo vive en un solo proceso y un solo hilo (el event loop de uvicorn).
   solo cambia de corrutina en un `await`. Las modificaciones del dict
   (`encolar`, cambios de estado en `_procesar`) no tienen un `await` en el
   medio, así que ninguna otra corrutina puede interrumpirlas a la mitad.
-- **`asyncio.Queue` y no `queue.Queue`.** `Queue.get()` de asyncio es una
-  corrutina: mientras no hay nada, el worker se suspende y cede el control
-  al event loop. Un `queue.Queue.get()` bloquearía el hilo entero, o sea la
-  API completa. _(A completar con más detalle.)_
+- **`asyncio.Queue` y no `queue.Queue`.** Los workers son corrutinas que
+  comparten un único hilo, el del event loop. `asyncio.Queue.get()` es una
+  corrutina: si la cola está vacía, el worker se suspende con `await` y el
+  event loop sigue atendiendo a los demás. `queue.Queue.get()` es
+  bloqueante: dejaría al hilo entero esperando, y como ese hilo es el del
+  event loop, se congelaría la API y todos los workers a la vez. Además,
+  `queue.Queue` usa locks para ser seguro entre hilos, algo que acá no hace
+  falta: todo corre en un hilo y solo se cambia de corrutina en un `await`.
+  Es el mismo patrón productor-consumidor que vimos con threads, pero con
+  corrutinas.
 - **Los workers nacen en el `lifespan` de FastAPI**, porque necesitan el
   event loop de uvicorn ya corriendo.
 - **Una tarea que falla no tumba al worker.** `_procesar` captura
@@ -164,9 +179,10 @@ Todo vive en un solo proceso y un solo hilo (el event loop de uvicorn).
   está calculando: seguiría quemando CPU hasta terminar. El hash iterado se
   puede cortar (el resultado de un pedazo es la entrada del siguiente), y
   entre pedazo y pedazo hay un `await` donde entran la cancelación y el
-  timeout. Lo máximo que se desperdicia es un pedazo (~0,2 s). Verifiqué que el
-  proceso hijo deja de consumir CPU después de cancelar. Costo: ~5 % más de
-  tiempo total por los viajes entre procesos.
+  timeout. Lo máximo que se desperdicia es un pedazo (~0,2 s). Al cancelar, el
+  proceso hijo deja de consumir CPU. 
+  Costo: un pequeño sobrecosto por los viajes entre procesos (pickle) en cada
+  pedazo.
 - **Las señales se atrapan con `loop.add_signal_handler`**, no con
   `signal.signal`. Un handler de `signal.signal` corre interrumpiendo al
   intérprete en un punto cualquiera, donde no es seguro tocar el estado de
@@ -246,11 +262,12 @@ dos tareas una después de la otra para que no compitan por la red.
 
 | Entorno | N | Secuencial | Concurrente | Speedup |
 |---|---|---|---|---|
-| Servidor local de prueba (0.5 s por request) | 20 | 10.09 s | 0.57 s | 17.7x |
 | httpbin.org/delay/1 (red real, mi máquina) | 20 | 24.06 s | 2.09 s | 11.5x |
 
-El speedup no llega a 20x porque hay costo fijo por conexión y el
-scheduling del event loop. Si dependiera solo de la espera, sería ideal.
+Con 20 descargas de 1 s la ganancia fue de 11,5x y no de 20x. Mi hipótesis
+(que no medí por separado) es que influyen el costo de abrir 20 conexiones
+TLS a la vez, que httpbin es un servicio público compartido y el trabajo del
+event loop. En una red real, cada descarga no es exactamente un `sleep`.
 
 ### 2. CPU-bound con y sin executor
 
@@ -260,24 +277,155 @@ tarda cada respuesta.
 
 | Entorno | Modo | Duración del hash | GETs completados | Latencia media | Latencia máxima |
 |---|---|---|---|---|---|
-| Pruebas en sandbox | bloqueante (sin executor) | 3.82 s | 1 | 3819 ms | 3819 ms |
-| Pruebas en sandbox | con executor | 3.44 s | 67 | 2 ms | 6 ms |
 | Mi máquina | bloqueante (sin executor) | 3.35 s | 1 | 3355 ms | 3355 ms |
 | Mi máquina | con executor | 3.35 s | 66 | 2 ms | 5 ms |
 
-> Nota: estos números se midieron en la etapa 4, cuando el hash iba al
-> executor de una sola vez. En la etapa 5 se divide en pedazos para poder
-> cancelarlo; en el sandbox eso hizo que el modo executor tarde ~5 % más
-> (4,41 s contra 4,17 s del modo bloqueante, 10 millones de iteraciones) con
-> la misma latencia de la API (máx. 6 ms). Los números finales se re-miden en
-> la etapa 7.
 
 Sin executor, el único `GET` que alcanzó a hacerse quedó trabado todo el
 tiempo que duró el hash: la API estuvo congelada. Con executor, la tarea
-tarda casi lo mismo, pero la API respondió 67 veces con latencia de
+tarda casi lo mismo, pero la API respondió 66 veces con latencia de
 milisegundos. El executor no hace más rápido el hash; hace que no bloquee al
 resto.
 
+### 3. Techo del pool
+
+Script: `python3 scripts/medir_techo.py`. Lanza N tareas de golpe, para
+distintos N, y mide (con los timestamps que guarda el servidor en cada tarea)
+cuánto tarda en terminar todo, cuánto tarda cada tarea desde que se creó, y
+cuánto espera en la cola antes de empezar.
+
+**Hipótesis previa (el modelo).** Cada worker ejecuta una tarea a la vez, así
+que como mucho W tareas avanzan al mismo tiempo (W = `NUM_WORKERS`). Con
+N ≤ W todas arrancan al instante y el total es lo que dura UNA tarea. Con
+N > W las sobrantes esperan en la cola: el total sube a `ceil(N/W) x d`
+(d = duración de una tarea sola), la latencia crece de forma lineal con N y el
+throughput se queda clavado en `W/d` tareas por segundo.
+
+- **Tareas de I/O (`esperar`, `descargar`)**: el techo es W, y es una decisión
+  de diseño, no un límite físico. Una corrutina esperando no consume CPU, así
+  que subir W sube el techo casi sin costo.
+- **Tareas de CPU (`hashear`)**: el techo es `min(W, núcleos)`. Los hashes
+  corren en procesos y cada uno necesita un núcleo para avanzar; con más
+  procesos que núcleos no hay más trabajo hecho por segundo, solo más procesos
+  peleándose por el procesador.
+
+**Cómo reproducirlo** (`nproc` es la cantidad de núcleos de la máquina):
+
+```bash
+# A. I/O con 3 workers
+docker compose up -d --build && sleep 3
+python3 scripts/medir_techo.py --tipo esperar
+
+# B. I/O con 20 workers: el techo se mueve
+NUM_WORKERS=20 docker compose up -d && sleep 3
+python3 scripts/medir_techo.py --tipo esperar --ns 1,3,12,24,48
+
+# C. CPU con tantos workers como núcleos
+NUM_WORKERS=$(nproc) docker compose up -d && sleep 3
+python3 scripts/medir_techo.py --tipo hashear --ns 1,4,8,16,24,32,48
+
+# D. CPU con el doble de workers que núcleos
+NUM_WORKERS=$(( 2 * $(nproc) )) docker compose up -d && sleep 3
+python3 scripts/medir_techo.py --tipo hashear --ns 1,4,8,16,24,32,48
+
+NUM_WORKERS=3 docker compose up -d      # volver al valor por defecto
+```
+
+**Resultados en mi máquina** _(16 procesadores lógicos)_
+
+#### A. Tareas de I/O (`esperar`, 1 s), 3 workers
+
+| N tareas | Total (s) | Ideal (s) | Latencia media (s) | Latencia máx (s) | Espera media en cola (s) | Tareas/s |
+|---|---|---|---|---|---|---|
+| 1 | 1.00 | 1.00 | 1.00 | 1.00 | 0.00 | 1.0 |
+| 2 | 1.00 | 1.00 | 1.00 | 1.00 | 0.00 | 2.0 |
+| 3 | 1.00 | 1.00 | 1.00 | 1.00 | 0.00 | 3.0 |
+| 4 | 2.00 | 2.00 | 1.25 | 1.99 | 0.25 | 2.0 |
+| 6 | 2.00 | 2.00 | 1.50 | 2.00 | 0.50 | 3.0 |
+| 9 | 3.01 | 3.00 | 1.99 | 2.99 | 0.99 | 3.0 |
+| 12 | 4.00 | 4.00 | 2.49 | 3.99 | 1.49 | 3.0 |
+| 24 | 8.01 | 8.00 | 4.48 | 7.97 | 3.48 | 3.0 |
+| 48 | 16.01 | 16.00 | 8.47 | 15.94 | 7.47 | 3.0 |
+
+**Lectura de A.** Hasta 3 tareas simultáneas el total es 1 s, lo que dura una
+sola. En N=4 salta a 2 s: el techo está en 3, igual que `NUM_WORKERS`. Desde
+ahí el total sigue a `ceil(N/3) x 1 s` casi exacto, así que no hay ningún otro
+límite: el único cuello de botella es el pool. El throughput queda clavado en
+3 tareas/s (`W/d`). Lo que se degrada no es el tiempo de ejecución (cada tarea
+sigue durando 1 s) sino la **espera en cola**: la latencia media pasa de 1 s a
+8,5 s en N=48 porque 45 tareas esperan su turno.
+
+#### B. Tareas de I/O (`esperar`, 1 s), 20 workers
+
+| N tareas | Total (s) | Ideal (s) | Latencia media (s) | Latencia máx (s) | Espera media en cola (s) | Tareas/s |
+|---|---|---|---|---|---|---|
+| 1 | 1.00 | 1.00 | 1.00 | 1.00 | 0.00 | 1.0 |
+| 3 | 1.01 | 1.00 | 1.00 | 1.00 | 0.00 | 3.0 |
+| 12 | 1.02 | 1.00 | 1.00 | 1.00 | 0.00 | 11.7 |
+| 24 | 2.01 | 2.00 | 1.16 | 1.97 | 0.16 | 12.0 |
+| 48 | 3.02 | 3.00 | 1.72 | 2.93 | 0.72 | 15.9 |
+
+**Lectura de B.** Con 20 workers el techo se movió de 3 a 20. El total vuelve a
+seguir a `ceil(N/20) x 1 s` (2 s para N=24, 3 s para N=48). Las 48 tareas
+pasaron de tardar 16 s (con 3 workers) a 3 s, y la espera media en cola de
+7,5 s a 0,7 s, sin ningún costo visible: cada tarea sigue durando 1 s, porque
+una corrutina que espera en `asyncio.sleep` casi no consume recursos. El
+throughput no llega a 20 tareas/s porque 48 = 20 + 20 + 8: la última tanda
+usa solo 8 workers. Subir el techo de las tareas de I/O es barato.
+
+#### C. Tareas de CPU (`hashear`, 2 millones de iteraciones), 16 workers
+
+| N tareas | Total (s) | Ideal (s) | Latencia media (s) | Latencia máx (s) | Espera media en cola (s) | Tareas/s |
+|---|---|---|---|---|---|---|
+| 1 | 1.61 | 1.61 | 1.61 | 1.61 | 0.00 | 0.6 |
+| 4 | 1.60 | 1.61 | 1.59 | 1.60 | 0.00 | 2.5 |
+| 8 | 2.20 | 1.61 | 1.87 | 2.19 | 0.00 | 3.6 |
+| 16 | 3.13 | 1.61 | 2.77 | 3.08 | 0.00 | 5.1 |
+| 24 | 4.89 | 3.22 | 3.43 | 4.84 | 0.85 | 4.9 |
+| 32 | 5.91 | 3.22 | 4.09 | 5.83 | 1.39 | 5.4 |
+| 48 | 8.66 | 4.83 | 5.40 | 8.54 | 2.73 | 5.5 |
+
+#### D. Tareas de CPU, 32 workers (el doble que los procesadores)
+
+| N tareas | Total (s) | Ideal (s) | Latencia media (s) | Latencia máx (s) | Espera media en cola (s) | Tareas/s |
+|---|---|---|---|---|---|---|
+| 1 | 1.68 | 1.68 | 1.68 | 1.68 | 0.00 | 0.6 |
+| 4 | 1.65 | 1.68 | 1.61 | 1.65 | 0.00 | 2.4 |
+| 8 | 2.18 | 1.68 | 1.90 | 2.17 | 0.00 | 3.7 |
+| 16 | 3.00 | 1.68 | 2.75 | 2.98 | 0.00 | 5.3 |
+| 24 | 4.27 | 3.36 | 3.80 | 4.23 | 0.00 | 5.6 |
+| 32 | 5.72 | 3.36 | 4.86 | 5.63 | 0.00 | 5.6 |
+| 48 | 8.42 | 5.04 | 6.20 | 8.29 | 1.56 | 5.7 |
+
+**Lectura de C y D.** Acá el límite no es el pool. Con N=4 las tareas corren
+en paralelo casi perfecto (1,60 s, igual que una sola). Pero con N=16 y 16
+workers todas arrancan sin esperar en cola (espera 0,00 s) y el total es
+3,13 s, casi el doble de una tarea sola: se frenan entre sí. El throughput
+sube hasta unas 5,5 tareas/s y se aplana, o sea unas 9 veces lo que hace una
+tarea sola (1/1,61 = 0,62 tareas/s), no 16.
+
+Mi procesador es un i5-1240P: 12 núcleos físicos (4 de alto rendimiento con
+hyperthreading y 8 eficientes) y 16 procesadores lógicos (`lscpu`). Un
+procesador lógico no rinde lo que un núcleo completo: dos hilos de un mismo
+núcleo se reparten sus recursos, y un núcleo eficiente es más lento que uno
+de alto rendimiento. Por eso el throughput máximo equivale a unas 9 tareas
+corriendo a la velocidad de una sola y no a 16; es consistente con esa
+mezcla de núcleos, aunque no lo medí por separado. Además, en un portátil
+todos los núcleos comparten consumo y temperatura, y el servidor y el script
+de medición también usan CPU.
+
+Con 32 workers (D) el throughput es igual o apenas mejor (5,7 contra 5,5 en
+N=48, dentro del ruido de una sola corrida): duplicar los procesos no dio
+más trabajo por segundo, pero tampoco lo empeoró.
+
+#### Conclusión: dónde está el límite y por qué
+
+- **Tareas de I/O:** el límite es `NUM_WORKERS`, una decisión de diseño. Es
+  barato moverlo: de 3 a 20 workers bajó 48 tareas de 16 s a 3 s sin costo
+  visible.
+- **Tareas de CPU:** el límite es el hardware, no el pool. Aun con 16 y 32
+  workers el sistema se estancó en unas 5,5 tareas/s, unas 9 veces una tarea
+  sola. Poner más procesos que procesadores no ayuda.
 
 ## Pruebas de cancelación y timeouts
 
@@ -287,10 +435,18 @@ Probado a mano con `curl` sobre la API corriendo en mi máquina:
 |---|---|
 | `esperar` de 10 s con `timeout_s: 2` | `fallida`, error `TimeoutError: superó el timeout de 2.0 s` |
 | `DELETE` sobre un `esperar` de 30 s en ejecución | `cancelada` al instante, con `fin_en` cargado |
-| `DELETE` sobre un `hashear` de 100 millones de iteraciones | `cancelada`, `workers_ocupados: 0` en `/estadisticas` |
+| `DELETE` sobre un `hashear` de 100 millones de iteraciones, midiendo con `docker stats` | CPU del contenedor de ~100 % antes del `DELETE` a ~0,2 % dos segundos después: el proceso hijo deja de calcular |
+
+## Conceptos del curso aplicados
+
+_(pendiente)_
 
 ## Limitaciones conocidas
 
+- `NUM_WORKERS` dimensiona a la vez el pool de workers (I/O) y el pool de
+  procesos del executor (CPU). Las mediciones muestran que sus techos son
+  distintos (I/O: barato de subir; CPU: acotado por el hardware), pero no se
+  pueden ajustar por separado.
 - Una tarea `hashear` con `bloqueante: true` no se puede cancelar ni
   vencer por timeout: no tiene ningún `await`, así que el event loop no puede
   interrumpirla (y mientras corre, congela la API). Es el punto de ese modo.
@@ -324,3 +480,7 @@ Probado a mano con `curl` sobre la API corriendo en mi máquina:
 - `loop.add_signal_handler` solo existe en Unix. En Windows sin Docker se
   usa el manejo de señales de uvicorn: el volcado igual se hace, pero la
   espera con límite pasa a depender de uvicorn.
+
+## Lo que aprendí
+
+_(pendiente)_

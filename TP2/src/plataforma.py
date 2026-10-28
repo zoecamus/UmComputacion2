@@ -232,6 +232,7 @@ class Plataforma:
             "por_estado": por_estado,
             "tiempo_promedio_s": promedio,
             "workers_total": self.num_workers,
+            "cpus": os.cpu_count(),  # núcleos visibles: techo de las tareas CPU-bound
             "workers_ocupados": self.ocupados,
             "en_cola": self.cola.qsize(),
             "apagando": self.cerrando,
