@@ -439,7 +439,42 @@ Probado a mano con `curl` sobre la API corriendo en mi máquina:
 
 ## Conceptos del curso aplicados
 
-_(pendiente)_
+- **Event loop de un solo hilo y ausencia de locks (clase 18).** La API, la
+  cola y los workers corren en el mismo hilo, y una corrutina solo se
+  interrumpe en un `await`. Por eso `Plataforma` modifica el diccionario de
+  tareas sin ningún `Lock`: entre una modificación y la siguiente no hay un
+  `await` en el medio (`encolar`, los cambios de estado de `_procesar`,
+  `cancelar`).
+- **Patrón productor-consumidor con corrutinas (clase 21; el mismo patrón
+  que vimos con threads).** `POST /tareas` produce ids en una `asyncio.Queue`
+  y los N workers (`_worker`) los consumen. A diferencia de `queue.Queue`,
+  `get()` es una corrutina: el worker ocioso se suspende sin bloquear el loop.
+- **API con FastAPI, validación y ciclo de vida (clase 19).** Los endpoints
+  son `async def`; `TareaCrear` (Pydantic) valida el cuerpo y responde 422
+  sin código propio; el `lifespan` crea los workers cuando el loop de uvicorn
+  ya está andando y los detiene al apagar.
+- **I/O asíncrono de red (clase 20).** La tarea `descargar` usa
+  `httpx.AsyncClient` y `asyncio.gather` para bajar las URLs a la vez; la
+  medición 1 muestra la diferencia con hacerlo en secuencia (24 s contra 2 s).
+- **Tareas CPU-bound y executors (clase 21; procesos y GIL de las clases de
+  multiprocessing y threading).** `hashear` no tiene ningún punto de espera,
+  así que asyncio no puede ayudar: se envía con `run_in_executor` a un
+  `ProcessPoolExecutor`, que corre en procesos aparte y no comparte el GIL.
+  La medición 2 muestra la API congelada sin executor y respondiendo con él.
+- **Cancelación y timeouts (clase 21).** `DELETE` llama a `Task.cancel()`,
+  que inyecta `CancelledError` (hereda de `BaseException`, por eso se captura
+  aparte) en el punto donde la tarea espera; `asyncio.timeout()` aplica
+  `timeout_s` con el mismo mecanismo. Los `async with` y `finally` liberan los
+  recursos (por ejemplo el `AsyncClient` de `descargar`) sin código extra.
+- **Señales y apagado ordenado (clase de señales).** `main.py` registra
+  `SIGTERM` y `SIGINT` con `loop.add_signal_handler`, para que el handler
+  corra dentro del event loop; `Plataforma.apagar` deja de aceptar tareas,
+  espera con límite y vuelca el estado a JSON. Los procesos hijos ignoran
+  `SIGINT` (`ignorar_sigint`) para que Ctrl+C no rompa el pool.
+- **Docker y Compose (clases de Docker).** `Dockerfile` y `docker-compose.yml`
+  levantan todo con `docker compose up --build`; un volumen (`./datos`) hace
+  sobrevivir los volcados, y `stop_grace_period` le da tiempo al apagado
+  ordenado antes del `SIGKILL`.
 
 ## Limitaciones conocidas
 
@@ -483,4 +518,20 @@ _(pendiente)_
 
 ## Lo que aprendí
 
-_(pendiente)_
+Lo que más me quedó es la diferencia entre una tarea de I/O y una de CPU. Antes
+de medirlo, para mí "asíncrono" era sinónimo de "rápido". Las mediciones me
+mostraron que no: asyncio sirve cuando hay algo que esperar (las 20 descargas
+pasaron de 24 s a 2 s con `gather`), pero un hash puro no tiene dónde ceder el
+control, y sin executor la API quedó congelada 3,35 s con un solo `GET`
+trabado, contra 5 ms con el executor. El executor no hace más rápido el cálculo;
+hace que no bloquee a los demás. Eso lo entendí recién cuando lo vi en mis
+propios números.
+
+La parte más difícil fue la cancelación y el apagado. Pensé que alcanzaba con
+`task.cancel()`, pero cancelar el `await` de `run_in_executor` no detiene al
+proceso hijo, así que tuve que dividir el hash en pedazos para tener puntos
+donde cortar, y lo comprobé con `docker stats` (el CPU bajó de ~100 % a ~0,2 %
+al cancelar). También aprendí que una cancelación puede llegar por dos motivos
+distintos (un `DELETE` o un apagado) y que hay que distinguirlos, y que
+`docker stop` mata al contenedor a los 10 s por defecto, por eso el
+`stop_grace_period`.
